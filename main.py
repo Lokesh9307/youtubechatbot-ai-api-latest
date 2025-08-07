@@ -34,7 +34,8 @@ def get_video_id(url: str) -> str | None:
 
 def get_transcript(video_id: str) -> str | None:
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        ytt = YouTubeTranscriptApi()
+        transcript_list = ytt.list_transcripts(video_id)
         try:
             transcript = transcript_list.find_transcript(['en', 'hi'])
         except Exception:
