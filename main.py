@@ -32,22 +32,43 @@ def get_video_id(url: str) -> str | None:
         match = re.search(r'(?:v=|\/)([a-zA-Z0-9_-]{11})', url)
         return match.group(1) if match else None
 
+from youtube_transcript_api import (
+    YouTubeTranscriptApi,
+    TranscriptsDisabled,
+    NoTranscriptFound
+)
+
 def get_transcript(video_id: str) -> str | None:
     try:
-        ytt = YouTubeTranscriptApi()
-        transcript_list = ytt.list_transcripts(video_id)
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+
+        # Try manual transcript first
         try:
             transcript = transcript_list.find_transcript(['en', 'hi'])
-        except Exception:
-            transcript = next(iter(transcript_list), None)
+        except NoTranscriptFound:
+            transcript = None
 
+        # If no manual transcript, try auto-generated
+        if not transcript:
+            try:
+                transcript = transcript_list.find_generated_transcript(['en', 'hi'])
+            except NoTranscriptFound:
+                transcript = None
+
+        # Fetch and join text
         if transcript:
             fetched = transcript.fetch()
-            return " ".join([item.text for item in fetched])
+            return " ".join(item["text"] for item in fetched)
+
+        return None
+
+    except (TranscriptsDisabled, NoTranscriptFound) as e:
+        print(f"[Transcript Error] {e}")
         return None
     except Exception as e:
         print(f"[Transcript Error] {e}")
         return None
+
 
 @app.post("/summarize")
 def summarize_video(request: VideoRequest):
