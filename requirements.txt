@@ -3,3 +3,11 @@ uvicorn==0.30.1
 google-generativeai==0.5.2
 youtube-transcript-api==0.6.2
 dotenv
+pytube
+requests
+pydantic
+faiss-cpu==1.7.4
+sentence_transformers
+faiss
+numpy
+typing

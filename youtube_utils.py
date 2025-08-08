@@ -10,15 +10,12 @@ from youtube_transcript_api import (
     TranscriptsDisabled,
     NoTranscriptFound
 )
+import dotenv
+# Load environment variables
+dotenv.load_dotenv()
 
-# Whisper fallback API key (optional)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-
 def get_youtube_video_id(url: str) -> str | None:
-    """
-    Extracts the YouTube video ID from various URL formats.
-    """
     if "youtu.be/" in url:
         return url.split("youtu.be/")[1].split("?")[0].split("&")[0]
     elif "youtube.com/watch?v=" in url:
@@ -43,21 +40,20 @@ def get_youtube_video_id(url: str) -> str | None:
 
 def get_youtube_transcript(video_id: str) -> str | None:
     """
-    Retrieves the transcript for a YouTube video.
-    Tries manual captions, then auto-generated captions.
-    Falls back to Whisper transcription if captions are unavailable (optional).
+    Tries: manual captions -> auto-generated -> Whisper (Groq) fallback (if GROQ_API_KEY set)
+    Logs every major decision so you can see why something failed.
+    Returns the full transcript text or None.
     """
-    # Step 1: Try YouTube captions
+    # Try captions first
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        ytt = YouTubeTranscriptApi()
+        transcript_list = ytt.list(video_id)
 
-        # Manual transcript
         try:
             transcript = transcript_list.find_transcript(['en', 'hi'])
         except NoTranscriptFound:
             transcript = None
 
-        # Auto-generated transcript
         if not transcript:
             try:
                 transcript = transcript_list.find_generated_transcript(['en', 'hi'])
@@ -65,40 +61,58 @@ def get_youtube_transcript(video_id: str) -> str | None:
                 transcript = None
 
         if transcript:
-            fetched_transcript = transcript.fetch()
-            return " ".join(item["text"] for item in fetched_transcript)
+            print(f"[Transcript Found] Video ID: {video_id} (captions retrieved)")
+            fetched = transcript.fetch()
+            return " ".join(item.text for item in fetched)
+
+        print(f"[No Captions] Video ID: {video_id} — No manual or auto-generated captions found.")
 
     except (TranscriptsDisabled, NoTranscriptFound):
-        pass
+        print(f"[Captions Disabled] Video ID: {video_id} — Subtitles are disabled.")
     except Exception as e:
         print(f"[Transcript Error] {e}")
 
-    # Step 2: Whisper fallback
-    if GROQ_API_KEY:
-        try:
-            print("[Fallback] Using Whisper via Groq API...")
-            yt = YouTube(f"https://www.youtube.com/watch?v={video_id}")
+    # Whisper fallback via Groq
+    if not GROQ_API_KEY:
+        print(f"[No GROQ_API_KEY] Cannot use Whisper fallback for Video ID: {video_id}")
+        print(f"[Transcript Not Available] Video ID: {video_id} — All retrieval methods failed.")
+        return None
+
+    try:
+        print(f"[Fallback] Using Whisper transcription for Video ID: {video_id}")
+        yt = YouTube(f"https://www.youtube.com/watch?v={video_id}")
+
+        # Force a common container format (mp4) so ffmpeg/Groq accept it
+        audio_stream = yt.streams.filter(only_audio=True, file_extension='mp4').first()
+        if audio_stream is None:
             audio_stream = yt.streams.filter(only_audio=True).first()
 
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_file:
-                audio_stream.download(filename=temp_file.name)
-                temp_file_path = temp_file.name
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_file:
+            audio_stream.download(filename=temp_file.name)
+            temp_path = temp_file.name
 
-            with open(temp_file_path, "rb") as f:
-                resp = requests.post(
-                    "https://api.groq.com/openai/v1/audio/transcriptions",
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                    files={"file": f},
-                    data={"model": "whisper-large-v3"}
-                )
-            os.remove(temp_file_path)
+        with open(temp_path, "rb") as f:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                files={"file": f},
+                data={"model": "whisper-large-v3"}
+            )
 
-            if resp.status_code == 200:
-                return resp.json().get("text")
-            else:
-                print(f"[Whisper Error] {resp.status_code} {resp.text}")
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
 
-        except Exception as e:
-            print(f"[Whisper Error] {e}")
+        if resp.status_code == 200:
+            print(f"[Whisper Success] Video ID: {video_id} — Audio transcribed successfully.")
+            return resp.json().get("text")
+        else:
+            # Log full response body for debugging (important)
+            print(f"[Whisper API Error] {resp.status_code} — {resp.text}")
 
+    except Exception as e:
+        print(f"[Whisper Error] {e}")
+
+    print(f"[Transcript Not Available] Video ID: {video_id} — All retrieval methods failed.")
     return None
