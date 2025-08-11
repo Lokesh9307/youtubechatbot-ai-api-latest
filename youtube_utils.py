@@ -1,7 +1,10 @@
 import os
 import re
 import tempfile
+import math
+from typing import Optional
 from urllib.parse import urlparse, parse_qs
+
 from pytube import YouTube
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
@@ -9,19 +12,13 @@ from youtube_transcript_api import (
     NoTranscriptFound
 )
 from pydub import AudioSegment
-from typing import Optional
-from google.cloud import speech, storage
-
-# Google Cloud setup
-GCP_BUCKET_NAME = os.getenv("GCP_BUCKET_NAME")  # Must be set for async STT
-LANGUAGES = ["en-US", "hi-IN"]
+from google.cloud import speech
 
 # Limits
 MAX_VIDEO_LENGTH_SEC = 7200  # 2 hours
-SYNC_MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB for sync STT
 
 def get_youtube_video_id(url: str) -> Optional[str]:
-    """Extract YouTube video ID from various URL formats."""
+    """Extract YouTube video ID from various YouTube URL formats."""
     if "youtu.be/" in url:
         return url.split("youtu.be/")[1].split("?")[0].split("&")[0]
     elif "youtube.com/watch?v=" in url:
@@ -54,66 +51,54 @@ def _choose_audio_stream(yt: YouTube):
     return audio_streams.first() if audio_streams else None
 
 
-def _transcribe_google_sync(path: str) -> Optional[str]:
-    """Synchronous STT for small files."""
+def _transcribe_with_google_stt(audio_path: str) -> Optional[str]:
+    """Transcribe an audio file using Google Cloud Speech-to-Text."""
     client = speech.SpeechClient()
-    with open(path, "rb") as f:
+
+    audio = AudioSegment.from_file(audio_path)
+    duration_sec = len(audio) / 1000
+
+    # Convert to FLAC for upload
+    with tempfile.NamedTemporaryFile(suffix=".flac", delete=False) as tmp_flac:
+        audio.export(tmp_flac.name, format="flac")
+        flac_path = tmp_flac.name
+
+    with open(flac_path, "rb") as f:
         content = f.read()
 
-    audio = speech.RecognitionAudio(content=content)
+    gcs_audio = speech.RecognitionAudio(content=content)
     config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.MP3,
-        sample_rate_hertz=44100,
-        language_code=LANGUAGES[0],
-        alternative_language_codes=LANGUAGES[1:],
+        encoding=speech.RecognitionConfig.AudioEncoding.FLAC,
+        sample_rate_hertz=audio.frame_rate,
+        language_code="en-US",
         enable_automatic_punctuation=True
     )
 
-    print("[Google STT] Sync request sending...")
-    response = client.recognize(config=config, audio=audio)
-    transcript = " ".join(result.alternatives[0].transcript for result in response.results)
-    return transcript if transcript.strip() else None
+    try:
+        if duration_sec > 60:
+            print(f"[Google STT] Long-running recognition, {duration_sec:.1f}s audio")
+            operation = client.long_running_recognize(config=config, audio=gcs_audio)
+            response = operation.result(timeout=duration_sec * 2)
+        else:
+            print(f"[Google STT] Synchronous recognition, {duration_sec:.1f}s audio")
+            response = client.recognize(config=config, audio=gcs_audio)
 
+        transcript_parts = []
+        for result in response.results:
+            transcript_parts.append(result.alternatives[0].transcript.strip())
 
-def _transcribe_google_async(path: str) -> Optional[str]:
-    """Async STT for large files using GCS."""
-    if not GCP_BUCKET_NAME:
-        print("[Google STT] Missing GCP_BUCKET_NAME for async transcription.")
+        os.remove(flac_path)
+        return " ".join(transcript_parts) if transcript_parts else None
+    except Exception as e:
+        print(f"[Google STT Error] {e}")
         return None
-
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(GCP_BUCKET_NAME)
-    blob_name = os.path.basename(path)
-    blob = bucket.blob(blob_name)
-    blob.upload_from_filename(path)
-    gcs_uri = f"gs://{GCP_BUCKET_NAME}/{blob_name}"
-    print(f"[Google STT] Uploaded to {gcs_uri}")
-
-    client = speech.SpeechClient()
-    audio = speech.RecognitionAudio(uri=gcs_uri)
-    config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.MP3,
-        sample_rate_hertz=44100,
-        language_code=LANGUAGES[0],
-        alternative_language_codes=LANGUAGES[1:],
-        enable_automatic_punctuation=True
-    )
-
-    operation = client.long_running_recognize(config=config, audio=audio)
-    print("[Google STT] Waiting for operation to complete...")
-    response = operation.result(timeout=1800)  # up to 30 min
-
-    transcript = " ".join(result.alternatives[0].transcript for result in response.results)
-    blob.delete()  # Clean up
-    return transcript if transcript.strip() else None
 
 
 def get_youtube_transcript(video_id: str) -> Optional[str]:
     """Get transcript via captions or Google STT fallback."""
     # Try captions first
     try:
-        ytt = YouTubeTranscriptApi()
-        transcript_list = ytt.list_transcripts(video_id)
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
 
         transcript = None
         try:
@@ -137,8 +122,8 @@ def get_youtube_transcript(video_id: str) -> Optional[str]:
         print(f"[Transcript Error] {e}")
 
     # Google STT fallback
+    print(f"[Fallback] Google STT transcription for {video_id}")
     try:
-        print(f"[Fallback] Google STT transcription for {video_id}")
         yt = YouTube(f"https://www.youtube.com/watch?v={video_id}")
         if yt.length > MAX_VIDEO_LENGTH_SEC:
             print(f"[Video Too Long] {yt.length} sec")
@@ -149,25 +134,12 @@ def get_youtube_transcript(video_id: str) -> Optional[str]:
             print(f"[No Audio Stream] {video_id}")
             return None
 
-        subtype = getattr(audio_stream, "subtype", "") or "mp4"
-
         with tempfile.TemporaryDirectory() as tmp_dir:
-            raw_path = os.path.join(tmp_dir, f"audio.{subtype}")
+            subtype = getattr(audio_stream, "subtype", "") or "mp4"
+            temp_path = os.path.join(tmp_dir, f"audio.{subtype}")
             audio_stream.download(output_path=tmp_dir, filename=f"audio.{subtype}")
 
-            mp3_path = os.path.join(tmp_dir, "audio.mp3")
-            AudioSegment.from_file(raw_path).export(mp3_path, format="mp3")
-            file_size = os.path.getsize(mp3_path)
-            print(f"[Converted to MP3] size={file_size} bytes")
-
-            if file_size <= SYNC_MAX_FILE_BYTES:
-                return _transcribe_google_sync(mp3_path)
-            else:
-                return _transcribe_google_async(mp3_path)
-
+            return _transcribe_with_google_stt(temp_path)
     except Exception as e:
         print(f"[Google STT Error] {e}")
         return None
-
-    print(f"[Transcript Not Available] {video_id}")
-    return None
