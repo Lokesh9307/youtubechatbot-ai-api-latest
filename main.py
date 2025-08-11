@@ -1,3 +1,4 @@
+# main.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import google.generativeai as genai
@@ -7,6 +8,7 @@ from typing import List, Dict
 from fastapi.middleware.cors import CORSMiddleware
 from youtube_utils import get_youtube_video_id, get_youtube_transcript
 
+# Vector/embedding libs
 from fastembed import TextEmbedding
 import faiss
 import numpy as np
@@ -20,13 +22,13 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all HTTP methods
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Load Gemini API
+# API key
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY not set.")
@@ -38,7 +40,7 @@ model = genai.GenerativeModel("gemini-2.5-flash")
 EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 embedder = TextEmbedding(EMBED_MODEL_NAME)
 
-# Session store
+# In-memory sessions
 sessions: Dict[str, Dict] = {}
 
 # Parameters
@@ -57,7 +59,6 @@ class ChatRequest(BaseModel):
 
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
-    """Chunk text into overlapping pieces."""
     if len(text) <= chunk_size:
         return [text]
     chunks = []
@@ -72,11 +73,12 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
 
 
 def embed_texts(texts: List[str]) -> np.ndarray:
-    """Embed and normalize texts for cosine similarity search."""
-    embs = np.array(list(embedder.embed(texts)))
+    embs_generator = embedder.embed(texts)
+    embs = np.array(list(embs_generator))
     norms = np.linalg.norm(embs, axis=1, keepdims=True)
     norms[norms == 0] = 1e-9
-    return (embs / norms).astype("float32")
+    embs = embs / norms
+    return embs.astype('float32')
 
 
 @app.post("/load_video")
@@ -86,7 +88,7 @@ def load_video(request: VideoRequest):
         raise HTTPException(status_code=400, detail="Invalid YouTube URL")
 
     transcript = get_youtube_transcript(vid)
-    if not transcript or not transcript.strip():
+    if not transcript:
         return {
             "status": "transcript_unavailable",
             "reason": "No captions and Google Speech-to-Text fallback failed or unsupported audio format",
@@ -98,20 +100,19 @@ def load_video(request: VideoRequest):
         raise HTTPException(status_code=500, detail="Failed to chunk transcript")
 
     embs = embed_texts(chunks)
-
     dim = embs.shape[1]
     index = faiss.IndexFlatIP(dim)
     index.add(embs)
 
     id2chunk = {i: chunks[i] for i in range(len(chunks))}
-
     session_id = str(uuid.uuid4())
     sessions[session_id] = {
         "index": index,
         "id2chunk": id2chunk,
         "history": [],
-        "meta": {"video_id": vid, "n_chunks": len(chunks)}
+        "meta": {"video_id": vid, "n_chunks": len(chunks)},
     }
+
     print(f"[Session Created] {session_id} video={vid} chunks={len(chunks)}")
     return {"session_id": session_id, "n_chunks": len(chunks)}
 
@@ -128,14 +129,16 @@ def chat(request: ChatRequest):
 
     q_emb = embed_texts([query])
     D, I = session["index"].search(q_emb, TOP_K)
-
-    retrieved_chunks = [session["id2chunk"].get(int(idx)) for idx in I[0] if idx >= 0]
-    retrieved_chunks = [c for c in retrieved_chunks if c]
+    retrieved_chunks = [
+        session["id2chunk"].get(int(idx))
+        for idx in I[0] if idx >= 0 and session["id2chunk"].get(int(idx))
+    ]
 
     history_text = ""
     if session["history"]:
         history_text = "\n".join(
-            [f"User: {q}\nAssistant: {a}" for q, a in session["history"][-6:]]
+            f"User: {q}\nAssistant: {a}"
+            for q, a in session["history"][-6:]
         )
 
     context = "\n\n---\n\n".join(retrieved_chunks) if retrieved_chunks else ""

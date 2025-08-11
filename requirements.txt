@@ -2,14 +2,14 @@ fastapi==0.110.0
 uvicorn==0.30.1
 google-generativeai==0.5.2
 youtube-transcript-api==0.6.2
-dotenv
+python-dotenv  # correct package name for dotenv
 pytube
 requests
 pydantic
-numpy<2.0,>=1.19  # Pin to avoid incompatibility with faiss
-faiss-cpu==1.8.0  # Upgraded from 1.7.4; use latest if preferred (e.g., ==1.11.0.post1)
+numpy>=1.19,<2.0  # Pin to avoid incompatibility with faiss
+faiss-cpu==1.8.0
 fastembed
-typing
+typing-extensions  # 'typing' built-in, but typing-extensions may be needed
 pydub
 google-cloud-speech
 google-cloud-storage
