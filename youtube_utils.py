@@ -57,9 +57,15 @@ def _choose_audio_stream(yt: YouTube):
 
 
 def _transcribe_file(path: str, filename: str) -> Optional[str]:
-    """Send a single MP3 file to Groq Whisper."""
+    size = os.path.getsize(path)
+    print(f"[DEBUG] Uploading to Groq: {filename} ({size} bytes)")
+
+    if size == 0:
+        print("[ERROR] Exported audio file is empty")
+        return None
+
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    data = {"model": "whisper-large-v3"}  # Correct model name
+    data = {"model": "whisper-large-v3"}  # Correct model
     with open(path, "rb") as f:
         files = {"file": (filename, f, "audio/mpeg")}
         resp = requests.post(
@@ -69,11 +75,13 @@ def _transcribe_file(path: str, filename: str) -> Optional[str]:
             data=data,
             timeout=120
         )
+    print(f"[DEBUG] Whisper API status: {resp.status_code}")
     if resp.status_code == 200:
         return resp.json().get("text")
     else:
         print(f"[Whisper API Error] {resp.status_code} — {resp.text}")
         return None
+
 
 
 def _chunk_and_transcribe(path: str, filename_base: str) -> Optional[str]:
