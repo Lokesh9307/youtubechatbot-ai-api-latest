@@ -1,7 +1,6 @@
 import os
 import re
 import tempfile
-import requests
 from urllib.parse import urlparse, parse_qs
 from pytube import YouTube
 from youtube_transcript_api import (
@@ -10,17 +9,16 @@ from youtube_transcript_api import (
     NoTranscriptFound
 )
 from pydub import AudioSegment
-import math
-import dotenv
 from typing import Optional
+from google.cloud import speech, storage
 
-dotenv.load_dotenv()
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# Google Cloud setup
+GCP_BUCKET_NAME = os.getenv("GCP_BUCKET_NAME")  # Must be set for async STT
+LANGUAGES = ["en-US", "hi-IN"]
 
 # Limits
 MAX_VIDEO_LENGTH_SEC = 7200  # 2 hours
-GROQ_MAX_FILE_BYTES = 100 * 1024 * 1024  # 100 MB limit for Groq
+SYNC_MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB for sync STT
 
 def get_youtube_video_id(url: str) -> Optional[str]:
     """Extract YouTube video ID from various URL formats."""
@@ -56,63 +54,62 @@ def _choose_audio_stream(yt: YouTube):
     return audio_streams.first() if audio_streams else None
 
 
-def _transcribe_file(path: str, filename: str) -> Optional[str]:
-    size = os.path.getsize(path)
-    print(f"[DEBUG] Uploading to Groq: {filename} ({size} bytes)")
-
-    if size == 0:
-        print("[ERROR] Exported audio file is empty")
-        return None
-
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    data = {"model": "whisper-large-v3"}  # Correct model
+def _transcribe_google_sync(path: str) -> Optional[str]:
+    """Synchronous STT for small files."""
+    client = speech.SpeechClient()
     with open(path, "rb") as f:
-        files = {"file": (filename, f, "audio/mpeg")}
-        resp = requests.post(
-            "https://api.groq.com/openai/v1/audio/transcriptions",
-            headers=headers,
-            files=files,
-            data=data,
-            timeout=120
-        )
-    print(f"[DEBUG] Whisper API status: {resp.status_code}")
-    if resp.status_code == 200:
-        return resp.json().get("text")
-    else:
-        print(f"[Whisper API Error] {resp.status_code} — {resp.text}")
+        content = f.read()
+
+    audio = speech.RecognitionAudio(content=content)
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.MP3,
+        sample_rate_hertz=44100,
+        language_code=LANGUAGES[0],
+        alternative_language_codes=LANGUAGES[1:],
+        enable_automatic_punctuation=True
+    )
+
+    print("[Google STT] Sync request sending...")
+    response = client.recognize(config=config, audio=audio)
+    transcript = " ".join(result.alternatives[0].transcript for result in response.results)
+    return transcript if transcript.strip() else None
+
+
+def _transcribe_google_async(path: str) -> Optional[str]:
+    """Async STT for large files using GCS."""
+    if not GCP_BUCKET_NAME:
+        print("[Google STT] Missing GCP_BUCKET_NAME for async transcription.")
         return None
 
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(GCP_BUCKET_NAME)
+    blob_name = os.path.basename(path)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_filename(path)
+    gcs_uri = f"gs://{GCP_BUCKET_NAME}/{blob_name}"
+    print(f"[Google STT] Uploaded to {gcs_uri}")
 
+    client = speech.SpeechClient()
+    audio = speech.RecognitionAudio(uri=gcs_uri)
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.MP3,
+        sample_rate_hertz=44100,
+        language_code=LANGUAGES[0],
+        alternative_language_codes=LANGUAGES[1:],
+        enable_automatic_punctuation=True
+    )
 
-def _chunk_and_transcribe(path: str, filename_base: str) -> Optional[str]:
-    """Split audio into <100MB chunks, transcribe each, merge text."""
-    audio = AudioSegment.from_file(path)
-    size_per_ms = os.path.getsize(path) / len(audio)  # bytes per ms
-    max_chunk_ms = int((GROQ_MAX_FILE_BYTES - 1024 * 10) / size_per_ms)  # leave buffer
-    chunks = math.ceil(len(audio) / max_chunk_ms)
-    print(f"[Audio Chunking] Splitting into {chunks} parts")
+    operation = client.long_running_recognize(config=config, audio=audio)
+    print("[Google STT] Waiting for operation to complete...")
+    response = operation.result(timeout=1800)  # up to 30 min
 
-    texts = []
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        for i in range(chunks):
-            start_ms = i * max_chunk_ms
-            end_ms = min((i + 1) * max_chunk_ms, len(audio))
-            chunk_audio = audio[start_ms:end_ms]
-
-            chunk_filename = f"{filename_base}_part{i+1}.mp3"
-            chunk_path = os.path.join(tmp_dir, chunk_filename)
-            chunk_audio.export(chunk_path, format="mp3")
-
-            part_text = _transcribe_file(chunk_path, chunk_filename)
-            if part_text:
-                texts.append(part_text)
-            else:
-                print(f"[Chunk Transcription Failed] Part {i+1}")
-    return " ".join(texts) if texts else None
+    transcript = " ".join(result.alternatives[0].transcript for result in response.results)
+    blob.delete()  # Clean up
+    return transcript if transcript.strip() else None
 
 
 def get_youtube_transcript(video_id: str) -> Optional[str]:
-    """Get transcript via captions or Whisper fallback."""
+    """Get transcript via captions or Google STT fallback."""
     # Try captions first
     try:
         ytt = YouTubeTranscriptApi()
@@ -139,13 +136,9 @@ def get_youtube_transcript(video_id: str) -> Optional[str]:
     except Exception as e:
         print(f"[Transcript Error] {e}")
 
-    # Whisper fallback
-    if not GROQ_API_KEY:
-        print(f"[No GROQ_API_KEY] Can't use Whisper for {video_id}")
-        return None
-
+    # Google STT fallback
     try:
-        print(f"[Fallback] Whisper transcription for {video_id}")
+        print(f"[Fallback] Google STT transcription for {video_id}")
         yt = YouTube(f"https://www.youtube.com/watch?v={video_id}")
         if yt.length > MAX_VIDEO_LENGTH_SEC:
             print(f"[Video Too Long] {yt.length} sec")
@@ -162,24 +155,18 @@ def get_youtube_transcript(video_id: str) -> Optional[str]:
             raw_path = os.path.join(tmp_dir, f"audio.{subtype}")
             audio_stream.download(output_path=tmp_dir, filename=f"audio.{subtype}")
 
-            file_size = os.path.getsize(raw_path)
-            print(f"[Downloaded Audio] size={file_size} bytes")
-
-            # Always convert to mp3 before sending to Groq
             mp3_path = os.path.join(tmp_dir, "audio.mp3")
             AudioSegment.from_file(raw_path).export(mp3_path, format="mp3")
+            file_size = os.path.getsize(mp3_path)
+            print(f"[Converted to MP3] size={file_size} bytes")
 
-            mp3_size = os.path.getsize(mp3_path)
-            print(f"[Converted to MP3] size={mp3_size} bytes")
-
-            if mp3_size <= GROQ_MAX_FILE_BYTES:
-                return _transcribe_file(mp3_path, "audio.mp3")
+            if file_size <= SYNC_MAX_FILE_BYTES:
+                return _transcribe_google_sync(mp3_path)
             else:
-                print(f"[File Too Large After MP3] {mp3_size} bytes — chunking")
-                return _chunk_and_transcribe(mp3_path, "audio_chunk")
+                return _transcribe_google_async(mp3_path)
 
     except Exception as e:
-        print(f"[Whisper Error] {e}")
+        print(f"[Google STT Error] {e}")
         return None
 
     print(f"[Transcript Not Available] {video_id}")

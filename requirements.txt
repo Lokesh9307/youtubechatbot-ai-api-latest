@@ -11,3 +11,5 @@ faiss-cpu==1.8.0  # Upgraded from 1.7.4; use latest if preferred (e.g., ==1.11.0
 fastembed
 typing
 pydub
+google-cloud-speech
+google-cloud-storage
