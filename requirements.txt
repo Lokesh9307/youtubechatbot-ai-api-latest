@@ -10,3 +10,4 @@ numpy<2.0,>=1.19  # Pin to avoid incompatibility with faiss
 faiss-cpu==1.8.0  # Upgraded from 1.7.4; use latest if preferred (e.g., ==1.11.0.post1)
 fastembed
 typing
+pydub

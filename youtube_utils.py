@@ -1,4 +1,3 @@
-# youtube_utils.py
 import os
 import re
 import tempfile
@@ -10,6 +9,8 @@ from youtube_transcript_api import (
     TranscriptsDisabled,
     NoTranscriptFound
 )
+from pydub import AudioSegment
+import math
 import dotenv
 from typing import Optional
 
@@ -18,8 +19,8 @@ dotenv.load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # Limits
-MAX_VIDEO_LENGTH_SEC = 7200  # 2 hours (protective)
-GROQ_MAX_FILE_BYTES = 100 * 1024 * 1024  # Groq accepts up to 100 MB for direct uploads (see docs).
+MAX_VIDEO_LENGTH_SEC = 7200  # 2 hours
+GROQ_MAX_FILE_BYTES = 100 * 1024 * 1024  # 100 MB limit for Groq
 
 def get_youtube_video_id(url: str) -> Optional[str]:
     """Extract YouTube video ID from various URL formats."""
@@ -46,50 +47,64 @@ def get_youtube_video_id(url: str) -> Optional[str]:
 
 
 def _choose_audio_stream(yt: YouTube):
-    """
-    From pytube YouTube object choose a suitable audio-only stream.
-    Prefer webm (widely accepted) then fallback to mp4/m4a.
-    Returns stream object or None.
-    """
+    """Prefer webm audio stream, fallback to lowest bitrate audio."""
     audio_streams = yt.streams.filter(only_audio=True).order_by('abr')
-    # Prefer webm subtype if available
     for s in audio_streams:
-        try:
-            subtype = getattr(s, "subtype", "")
-            mime = getattr(s, "mime_type", "")
-        except Exception:
-            subtype = ""
-            mime = ""
-        if "webm" in subtype or "webm" in mime:
+        subtype = getattr(s, "subtype", "")
+        if "webm" in subtype:
             return s
-    # Fallback to lowest-bitrate audio if no webm
-    try:
-        return audio_streams.first()
-    except Exception:
+    return audio_streams.first() if audio_streams else None
+
+
+def _transcribe_file(path: str, mime: str, filename: str) -> Optional[str]:
+    """Send a single audio file to Groq Whisper."""
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    data = {"model": "groq/whisper-large-v3"}
+    with open(path, "rb") as f:
+        files = {"file": (filename, f, mime)}
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers=headers,
+            files=files,
+            data=data,
+            timeout=120
+        )
+    if resp.status_code == 200:
+        return resp.json().get("text")
+    else:
+        print(f"[Whisper API Error] {resp.status_code} — {resp.text}")
         return None
 
 
-def _stream_filesize_bytes(stream) -> Optional[int]:
-    """
-    Try to get an accurate filesize from pytube stream (filesize or filesize_approx),
-    otherwise return None.
-    """
-    size = getattr(stream, "filesize", None)
-    if size:
-        return int(size)
-    size_approx = getattr(stream, "filesize_approx", None)
-    if size_approx:
-        return int(size_approx)
-    return None
+def _chunk_and_transcribe(path: str, mime: str, filename: str) -> Optional[str]:
+    """Split audio into <100MB chunks, transcribe each, merge text."""
+    audio = AudioSegment.from_file(path)
+    size_per_ms = os.path.getsize(path) / len(audio)  # bytes per ms
+    max_chunk_ms = int((GROQ_MAX_FILE_BYTES - 1024 * 10) / size_per_ms)  # buffer a little
+    chunks = math.ceil(len(audio) / max_chunk_ms)
+    print(f"[Audio Chunking] Splitting into {chunks} parts")
+
+    texts = []
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        for i in range(chunks):
+            start_ms = i * max_chunk_ms
+            end_ms = min((i + 1) * max_chunk_ms, len(audio))
+            chunk_audio = audio[start_ms:end_ms]
+            chunk_filename = f"{filename}_part{i+1}.mp3"
+            chunk_path = os.path.join(tmp_dir, chunk_filename)
+            chunk_audio.export(chunk_path, format="mp3")
+
+            part_text = _transcribe_file(chunk_path, "audio/mpeg", chunk_filename)
+            if part_text:
+                texts.append(part_text)
+            else:
+                print(f"[Chunk Transcription Failed] Part {i+1}")
+    return " ".join(texts) if texts else None
 
 
 def get_youtube_transcript(video_id: str) -> Optional[str]:
-    """
-    Tries: manual captions -> auto-generated -> Whisper (Groq) fallback (if GROQ_API_KEY set).
-    Logs every major decision so you can see why something failed.
-    Returns the transcript text or None.
-    """
-    # 1) Try captions via youtube_transcript_api
+    """Get transcript via captions or Whisper fallback."""
+    # Try captions first
     try:
         ytt = YouTubeTranscriptApi()
         transcript_list = ytt.list_transcripts(video_id)
@@ -107,128 +122,50 @@ def get_youtube_transcript(video_id: str) -> Optional[str]:
                 transcript = None
 
         if transcript:
-            print(f"[Transcript Found] Video ID: {video_id} (captions retrieved)")
-            fetched = transcript.fetch()
-            return " ".join(item['text'] for item in fetched)
-
-        print(f"[No Captions] Video ID: {video_id} — No manual or auto-generated captions found.")
-
+            print(f"[Transcript Found] {video_id} (captions)")
+            return " ".join(item['text'] for item in transcript.fetch())
+        print(f"[No Captions] {video_id}")
     except (TranscriptsDisabled, NoTranscriptFound):
-        print(f"[Captions Disabled] Video ID: {video_id} — Subtitles are disabled.")
+        print(f"[Captions Disabled] {video_id}")
     except Exception as e:
         print(f"[Transcript Error] {e}")
 
-    # 2) Whisper fallback via Groq
+    # Whisper fallback
     if not GROQ_API_KEY:
-        print(f"[No GROQ_API_KEY] Cannot use Whisper fallback for Video ID: {video_id}")
-        print(f"[Transcript Not Available] Video ID: {video_id} — All retrieval methods failed.")
+        print(f"[No GROQ_API_KEY] Can't use Whisper for {video_id}")
         return None
 
     try:
-        print(f"[Fallback] Using Whisper transcription for Video ID: {video_id}")
+        print(f"[Fallback] Whisper transcription for {video_id}")
         yt = YouTube(f"https://www.youtube.com/watch?v={video_id}")
-
-        # Basic length check
-        if getattr(yt, "length", 0) and yt.length > MAX_VIDEO_LENGTH_SEC:
-            print(f"[Video Too Long] Video ID: {video_id} — Exceeds max length ({yt.length} sec > {MAX_VIDEO_LENGTH_SEC} sec)")
+        if yt.length > MAX_VIDEO_LENGTH_SEC:
+            print(f"[Video Too Long] {yt.length} sec")
             return None
 
         audio_stream = _choose_audio_stream(yt)
-        if audio_stream is None:
-            print(f"[No Audio Stream] Video ID: {video_id}")
+        if not audio_stream:
+            print(f"[No Audio Stream] {video_id}")
             return None
 
-        # Try to get filesize from stream metadata if available
-        filesize = _stream_filesize_bytes(audio_stream)
-        if filesize is not None:
-            print(f"[Audio Stream Size] Video ID: {video_id} — stream filesize={filesize} bytes")
-            if filesize > GROQ_MAX_FILE_BYTES:
-                print(f"[Audio Too Large] Video ID: {video_id} — stream filesize {filesize} bytes > {GROQ_MAX_FILE_BYTES} bytes (Groq limit).")
-                return None
+        subtype = getattr(audio_stream, "subtype", "") or "mp4"
+        mime = "audio/webm" if "webm" in subtype else "audio/mp4"
 
-        # derive extension and mime type
-        subtype = getattr(audio_stream, "subtype", "") or ""
-        if "webm" in subtype:
-            ext = ".webm"
-            mime = "audio/webm"
-        elif "mp3" in subtype:
-            ext = ".mp3"
-            mime = "audio/mpeg"
-        elif "mp4" in subtype or "m4a" in subtype:
-            # m4a is safer for mp4-audio streams
-            ext = ".m4a"
-            mime = "audio/mp4"
-        else:
-            # fallback
-            ext = f".{subtype or 'audio'}"
-            mime = "application/octet-stream"
-
-        # Download to temporary directory with correct extension
         with tempfile.TemporaryDirectory() as tmp_dir:
-            temp_filename = "audio" + ext
-            temp_path = os.path.join(tmp_dir, temp_filename)
+            temp_path = os.path.join(tmp_dir, f"audio.{subtype}")
+            audio_stream.download(output_path=tmp_dir, filename=f"audio.{subtype}")
 
-            try:
-                audio_stream.download(output_path=tmp_dir, filename=temp_filename)
-            except Exception as dl_e:
-                # pytube sometimes fails on specific streams; log and abort
-                print(f"[Audio Download Error] Video ID: {video_id} — download failed: {dl_e}")
-                return None
+            file_size = os.path.getsize(temp_path)
+            print(f"[Downloaded Audio] size={file_size} bytes")
 
-            # verify file exists and size
-            if not os.path.exists(temp_path):
-                print(f"[Audio Download Error] Video ID: {video_id} — file not found after download: {temp_path}")
-                return None
-
-            actual_size = os.path.getsize(temp_path)
-            print(f"[Audio Downloaded] Video ID: {video_id} — path={temp_path} size={actual_size} bytes")
-
-            if actual_size == 0:
-                print(f"[Audio Download Error] Video ID: {video_id} — downloaded file is empty")
-                return None
-
-            if actual_size > GROQ_MAX_FILE_BYTES:
-                print(f"[Audio Too Large After Download] Video ID: {video_id} — downloaded file {actual_size} bytes > {GROQ_MAX_FILE_BYTES} bytes (Groq limit).")
-                return None
-
-            # Prepare multipart/form-data for Groq
-            headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-            # Use the Groq-compatible model identifier
-            data = {"model": "groq/whisper-large-v3"}
-
-            with open(temp_path, "rb") as f:
-                files = {"file": (temp_filename, f, mime)}
-                try:
-                    resp = requests.post(
-                        "https://api.groq.com/openai/v1/audio/transcriptions",
-                        headers=headers,
-                        files=files,
-                        data=data,
-                        timeout=120
-                    )
-                except requests.RequestException as re:
-                    print(f"[Whisper Request Error] Video ID: {video_id} — network error: {re}")
-                    return None
-
-            if resp.status_code == 200:
-                # successful transcription
-                try:
-                    text = resp.json().get("text")
-                except Exception:
-                    text = None
-                if text:
-                    print(f"[Whisper Success] Video ID: {video_id} — Audio transcribed successfully.")
-                    return text
-                else:
-                    print(f"[Whisper Success but no text] Video ID: {video_id} — resp body: {resp.text}")
-                    return None
+            if file_size <= GROQ_MAX_FILE_BYTES:
+                return _transcribe_file(temp_path, mime, f"audio.{subtype}")
             else:
-                print(f"[Whisper API Error] Video ID: {video_id} — status={resp.status_code} body={resp.text}")
-                # 400 Bad Request is likely due to file size, unsupported format, or bad model param
-                return None
+                print(f"[File Too Large] {file_size} bytes — chunking")
+                return _chunk_and_transcribe(temp_path, mime, "audio_chunk")
 
     except Exception as e:
         print(f"[Whisper Error] {e}")
+        return None
 
-    print(f"[Transcript Not Available] Video ID: {video_id} — All retrieval methods failed.")
+    print(f"[Transcript Not Available] {video_id}")
     return None
