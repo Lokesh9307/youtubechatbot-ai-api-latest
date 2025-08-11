@@ -90,7 +90,8 @@ def get_youtube_transcript(video_id: str) -> Optional[str]:
     """Get transcript via captions or Google Speech-to-Text fallback."""
     # Try captions first
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        ytt = YouTubeTranscriptApi()
+        transcript_list = ytt.list_transcripts(video_id)
         transcript = None
         try:
             transcript = transcript_list.find_transcript(['en', 'hi'])
