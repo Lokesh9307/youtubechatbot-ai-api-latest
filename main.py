@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from youtube_utils import get_youtube_video_id, get_youtube_transcript
 
 # Vector/embedding libs
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 import faiss
 import numpy as np
 
@@ -39,8 +39,8 @@ genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-2.5-flash")
 
 # Embedding model (local)
-EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
-embedder = SentenceTransformer(EMBED_MODEL_NAME)
+EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+embedder = TextEmbedding(EMBED_MODEL_NAME)
 
 # In-memory session store:
 # sessions: { session_id: { "index": faiss.IndexFlatIP, "id2chunk": {int: str}, "meta": {...}, "history": [(q,a), ...] } }
@@ -85,7 +85,9 @@ def embed_texts(texts: List[str]) -> np.ndarray:
     Return L2-normalized embeddings (rows = vectors).
     We'll normalize to use inner-product for cosine similarity in FAISS.
     """
-    embs = embedder.encode(texts, show_progress_bar=False, convert_to_numpy=True)
+    embs_generator = embedder.embed(texts)  # Returns a generator
+    embs = np.array(list(embs_generator))   # Convert to NumPy array
+    
     # normalize
     norms = np.linalg.norm(embs, axis=1, keepdims=True)
     norms[norms == 0] = 1e-9
