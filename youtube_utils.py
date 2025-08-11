@@ -56,7 +56,7 @@ def get_youtube_transcript(video_id: str) -> str | None:
     # Try captions first
     try:
         ytt = YouTubeTranscriptApi()
-        transcript_list = ytt.list(video_id)
+        transcript_list = ytt.list_transcripts(video_id)
 
         try:
             transcript = transcript_list.find_transcript(['en', 'hi'])
