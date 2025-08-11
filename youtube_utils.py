@@ -59,7 +59,7 @@ def _choose_audio_stream(yt: YouTube):
 def _transcribe_file(path: str, mime: str, filename: str) -> Optional[str]:
     """Send a single audio file to Groq Whisper."""
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    data = {"model": "groq/whisper-large-v3"}
+    data = {"model": "whisper-large-v3"}
     with open(path, "rb") as f:
         files = {"file": (filename, f, mime)}
         resp = requests.post(
