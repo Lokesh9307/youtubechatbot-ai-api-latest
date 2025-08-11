@@ -103,7 +103,12 @@ def load_video(request: VideoRequest):
 
     transcript = get_youtube_transcript(vid)
     if not transcript:
-        raise HTTPException(status_code=404, detail="Transcript not found")
+        # return structured JSON so frontend can handle gracefully
+        return {
+            "status": "transcript_unavailable",
+            "reason": "No captions and Whisper fallback failed or file too large/unsupported",
+            "video_id": vid
+        }
 
     # chunk
     chunks = chunk_text(transcript)
