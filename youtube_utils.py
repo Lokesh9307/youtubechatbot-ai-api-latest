@@ -56,7 +56,7 @@ def get_youtube_transcript(video_id: str) -> str | None:
     # Try captions first
     try:
         ytt = YouTubeTranscriptApi()
-        transcript_list = ytt.list_transcripts(video_id)
+        transcript_list = ytt.list(video_id)
 
         try:
             transcript = transcript_list.find_transcript(['en', 'hi'])
@@ -72,7 +72,7 @@ def get_youtube_transcript(video_id: str) -> str | None:
         if transcript:
             print(f"[Transcript Found] Video ID: {video_id} (captions retrieved)")
             fetched = transcript.fetch()
-            return " ".join(item['text'] for item in fetched)
+            return " ".join(item.text for item in fetched)
 
         print(f"[No Captions] Video ID: {video_id} — No manual or auto-generated captions found.")
 
