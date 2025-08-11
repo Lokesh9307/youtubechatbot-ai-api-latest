@@ -12,16 +12,19 @@ from youtube_transcript_api import (
     NoTranscriptFound
 )
 import dotenv
+
 # Load environment variables
 dotenv.load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# New constants for limits
-MAX_VIDEO_LENGTH_SEC = 7200  # 2 hours max; adjust as needed
-MAX_ESTIMATED_AUDIO_SIZE_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB max
+# Limits
+MAX_VIDEO_LENGTH_SEC = 7200  # 2 hours
+MAX_ESTIMATED_AUDIO_SIZE_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB
+
 
 def get_youtube_video_id(url: str) -> str | None:
+    """Extract YouTube video ID from various URL formats."""
     if "youtu.be/" in url:
         return url.split("youtu.be/")[1].split("?")[0].split("&")[0]
     elif "youtube.com/watch?v=" in url:
@@ -46,14 +49,13 @@ def get_youtube_video_id(url: str) -> str | None:
 
 def get_youtube_transcript(video_id: str) -> str | None:
     """
-    Tries: manual captions -> auto-generated -> Whisper (Groq) fallback (if GROQ_API_KEY set)
+    Tries: manual captions -> auto-generated -> Whisper (Groq) fallback (if GROQ_API_KEY set).
     Logs every major decision so you can see why something failed.
-    Returns the full transcript text or None.
     """
-    # Try captions first (unchanged)
+    # Try captions first
     try:
         ytt = YouTubeTranscriptApi()
-        transcript_list = ytt.list_transcripts(video_id)  # Fixed: use list_transcripts()
+        transcript_list = ytt.list(video_id)
 
         try:
             transcript = transcript_list.find_transcript(['en', 'hi'])
@@ -69,7 +71,7 @@ def get_youtube_transcript(video_id: str) -> str | None:
         if transcript:
             print(f"[Transcript Found] Video ID: {video_id} (captions retrieved)")
             fetched = transcript.fetch()
-            return " ".join(item['text'] for item in fetched)  # Fixed: use 'text' key
+            return " ".join(item.text for item in fetched)
 
         print(f"[No Captions] Video ID: {video_id} — No manual or auto-generated captions found.")
 
@@ -88,28 +90,39 @@ def get_youtube_transcript(video_id: str) -> str | None:
         print(f"[Fallback] Using Whisper transcription for Video ID: {video_id}")
         yt = YouTube(f"https://www.youtube.com/watch?v={video_id}")
 
-        # Add length check early
+        # Length check
         if yt.length > MAX_VIDEO_LENGTH_SEC:
             print(f"[Video Too Long] Video ID: {video_id} — Exceeds max length ({yt.length} sec > {MAX_VIDEO_LENGTH_SEC} sec)")
             return None
 
-        # Select lowest bitrate audio to minimize size
-        audio_stream = yt.streams.filter(only_audio=True).order_by('abr').first()  # Lowest ABR first
+        # Select lowest bitrate audio
+        audio_stream = yt.streams.filter(only_audio=True).order_by('abr').first()
         if audio_stream is None:
             print(f"[No Audio Stream] Video ID: {video_id}")
             return None
 
-        # Estimate size (abr in kbps, convert to bytes)
+        # Estimate size
         abr_kbps = int(audio_stream.abr.replace('kbps', ''))
-        estimated_size = (abr_kbps * 1024 / 8) * yt.length  # bytes (bitrate / 8 = bytes/sec)
+        estimated_size = (abr_kbps * 1024 / 8) * yt.length
         if estimated_size > MAX_ESTIMATED_AUDIO_SIZE_BYTES:
             print(f"[Audio Too Large] Video ID: {video_id} — Estimated size ({estimated_size / (1024**3):.2f} GB > {MAX_ESTIMATED_AUDIO_SIZE_BYTES / (1024**3):.2f} GB)")
             return None
 
+        # Download audio to temp file
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_file:
-            audio_stream.download(output_path=temp_file.name)  # Fixed: use output_path for temp
             temp_path = temp_file.name
 
+        audio_stream.download(
+            output_path=os.path.dirname(temp_path),
+            filename=os.path.basename(temp_path)
+        )
+
+        # Verify file is valid
+        if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+            print(f"[Audio Download Error] File missing or empty for Video ID: {video_id}")
+            return None
+
+        # Send to Whisper API
         with open(temp_path, "rb") as f:
             resp = requests.post(
                 "https://api.groq.com/openai/v1/audio/transcriptions",
@@ -127,7 +140,6 @@ def get_youtube_transcript(video_id: str) -> str | None:
             print(f"[Whisper Success] Video ID: {video_id} — Audio transcribed successfully.")
             return resp.json().get("text")
         else:
-            # Log full response body for debugging (important)
             print(f"[Whisper API Error] {resp.status_code} — {resp.text}")
 
     except Exception as e:
