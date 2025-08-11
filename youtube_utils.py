@@ -1,24 +1,22 @@
 import os
 import re
 import tempfile
-import math
-from typing import Optional
 from urllib.parse import urlparse, parse_qs
-
 from pytube import YouTube
-from youtube_transcript_api import (
-    YouTubeTranscriptApi,
-    TranscriptsDisabled,
-    NoTranscriptFound
-)
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from pydub import AudioSegment
-from google.cloud import speech
+from google.cloud import speech_v1p1beta1 as speech
+from google.cloud import storage
+import dotenv
 
-# Limits
+dotenv.load_dotenv()
+
+# Config
+BUCKET_NAME = os.getenv("GCP_BUCKET_NAME", "transcripts-store")
 MAX_VIDEO_LENGTH_SEC = 7200  # 2 hours
 
-def get_youtube_video_id(url: str) -> Optional[str]:
-    """Extract YouTube video ID from various YouTube URL formats."""
+def get_youtube_video_id(url: str):
+    """Extract video ID from various YouTube URL formats."""
     if "youtu.be/" in url:
         return url.split("youtu.be/")[1].split("?")[0].split("&")[0]
     elif "youtube.com/watch?v=" in url:
@@ -40,80 +38,61 @@ def get_youtube_video_id(url: str) -> Optional[str]:
             return match.group(1)
     return None
 
-
 def _choose_audio_stream(yt: YouTube):
-    """Prefer webm audio stream, fallback to lowest bitrate audio."""
+    """Choose best available audio stream."""
     audio_streams = yt.streams.filter(only_audio=True).order_by('abr')
     for s in audio_streams:
-        subtype = getattr(s, "subtype", "")
-        if "webm" in subtype:
+        if "webm" in getattr(s, "subtype", ""):
             return s
     return audio_streams.first() if audio_streams else None
 
+def _upload_to_gcs(local_path: str, gcs_path: str):
+    """Upload local file to GCS bucket."""
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(BUCKET_NAME)
+    blob = bucket.blob(gcs_path)
+    blob.upload_from_filename(local_path)
+    print(f"[GCS] Uploaded to gs://{BUCKET_NAME}/{gcs_path}")
+    return f"gs://{BUCKET_NAME}/{gcs_path}"
 
-def _transcribe_with_google_stt(audio_path: str) -> Optional[str]:
-    """Transcribe an audio file using Google Cloud Speech-to-Text."""
+def _google_stt_transcribe_gcs(gcs_uri: str) -> str:
+    """Transcribe audio from GCS using Google STT."""
     client = speech.SpeechClient()
 
-    audio = AudioSegment.from_file(audio_path)
-    duration_sec = len(audio) / 1000
-
-    # Convert to FLAC for upload
-    with tempfile.NamedTemporaryFile(suffix=".flac", delete=False) as tmp_flac:
-        audio.export(tmp_flac.name, format="flac")
-        flac_path = tmp_flac.name
-
-    with open(flac_path, "rb") as f:
-        content = f.read()
-
-    gcs_audio = speech.RecognitionAudio(content=content)
+    audio = speech.RecognitionAudio(uri=gcs_uri)
     config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.FLAC,
-        sample_rate_hertz=audio.frame_rate,
+        sample_rate_hertz=16000,
         language_code="en-US",
         enable_automatic_punctuation=True
     )
 
-    try:
-        if duration_sec > 60:
-            print(f"[Google STT] Long-running recognition, {duration_sec:.1f}s audio")
-            operation = client.long_running_recognize(config=config, audio=gcs_audio)
-            response = operation.result(timeout=duration_sec * 2)
-        else:
-            print(f"[Google STT] Synchronous recognition, {duration_sec:.1f}s audio")
-            response = client.recognize(config=config, audio=gcs_audio)
+    operation = client.long_running_recognize(config=config, audio=audio)
+    print("[Google STT] Waiting for operation to complete...")
+    response = operation.result(timeout=3600)
 
-        transcript_parts = []
-        for result in response.results:
-            transcript_parts.append(result.alternatives[0].transcript.strip())
+    full_text = []
+    for result in response.results:
+        full_text.append(result.alternatives[0].transcript)
+    return " ".join(full_text).strip()
 
-        os.remove(flac_path)
-        return " ".join(transcript_parts) if transcript_parts else None
-    except Exception as e:
-        print(f"[Google STT Error] {e}")
-        return None
-
-
-def get_youtube_transcript(video_id: str) -> Optional[str]:
+def get_youtube_transcript(video_id: str):
     """Get transcript via captions or Google STT fallback."""
-    # Try captions first
+    # Try captions
     try:
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-
         transcript = None
         try:
             transcript = transcript_list.find_transcript(['en', 'hi'])
         except NoTranscriptFound:
-            transcript = None
-
+            pass
         if not transcript:
             try:
                 transcript = transcript_list.find_generated_transcript(['en', 'hi'])
             except NoTranscriptFound:
-                transcript = None
-
+                pass
         if transcript:
-            print(f"[Transcript Found] {video_id} (captions)")
+            print(f"[Transcript Found] {video_id}")
             return " ".join(item['text'] for item in transcript.fetch())
         print(f"[No Captions] {video_id}")
     except (TranscriptsDisabled, NoTranscriptFound):
@@ -121,25 +100,34 @@ def get_youtube_transcript(video_id: str) -> Optional[str]:
     except Exception as e:
         print(f"[Transcript Error] {e}")
 
-    # Google STT fallback
-    print(f"[Fallback] Google STT transcription for {video_id}")
+    # Fallback: Google STT
     try:
+        print(f"[Fallback] Google STT transcription for {video_id}")
         yt = YouTube(f"https://www.youtube.com/watch?v={video_id}")
         if yt.length > MAX_VIDEO_LENGTH_SEC:
             print(f"[Video Too Long] {yt.length} sec")
             return None
-
         audio_stream = _choose_audio_stream(yt)
         if not audio_stream:
             print(f"[No Audio Stream] {video_id}")
             return None
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            subtype = getattr(audio_stream, "subtype", "") or "mp4"
-            temp_path = os.path.join(tmp_dir, f"audio.{subtype}")
-            audio_stream.download(output_path=tmp_dir, filename=f"audio.{subtype}")
+            audio_path = os.path.join(tmp_dir, "audio.webm")
+            audio_stream.download(output_path=tmp_dir, filename="audio.webm")
 
-            return _transcribe_with_google_stt(temp_path)
+            # Convert to FLAC 16kHz mono for Google STT
+            flac_path = os.path.join(tmp_dir, "audio.flac")
+            audio_seg = AudioSegment.from_file(audio_path)
+            audio_seg = audio_seg.set_channels(1).set_frame_rate(16000)
+            audio_seg.export(flac_path, format="flac")
+
+            # Upload to GCS and transcribe
+            gcs_uri = _upload_to_gcs(flac_path, f"{video_id}.flac")
+            return _google_stt_transcribe_gcs(gcs_uri)
+
     except Exception as e:
         print(f"[Google STT Error] {e}")
         return None
+
+    return None
