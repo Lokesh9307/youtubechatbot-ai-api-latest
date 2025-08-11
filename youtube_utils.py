@@ -56,12 +56,12 @@ def _choose_audio_stream(yt: YouTube):
     return audio_streams.first() if audio_streams else None
 
 
-def _transcribe_file(path: str, mime: str, filename: str) -> Optional[str]:
-    """Send a single audio file to Groq Whisper."""
+def _transcribe_file(path: str, filename: str) -> Optional[str]:
+    """Send a single MP3 file to Groq Whisper."""
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    data = {"model": "whisper-large-v3"}
+    data = {"model": "whisper-large-v3"}  # Correct model name
     with open(path, "rb") as f:
-        files = {"file": (filename, f, mime)}
+        files = {"file": (filename, f, "audio/mpeg")}
         resp = requests.post(
             "https://api.groq.com/openai/v1/audio/transcriptions",
             headers=headers,
@@ -76,11 +76,11 @@ def _transcribe_file(path: str, mime: str, filename: str) -> Optional[str]:
         return None
 
 
-def _chunk_and_transcribe(path: str, mime: str, filename: str) -> Optional[str]:
+def _chunk_and_transcribe(path: str, filename_base: str) -> Optional[str]:
     """Split audio into <100MB chunks, transcribe each, merge text."""
     audio = AudioSegment.from_file(path)
     size_per_ms = os.path.getsize(path) / len(audio)  # bytes per ms
-    max_chunk_ms = int((GROQ_MAX_FILE_BYTES - 1024 * 10) / size_per_ms)  # buffer a little
+    max_chunk_ms = int((GROQ_MAX_FILE_BYTES - 1024 * 10) / size_per_ms)  # leave buffer
     chunks = math.ceil(len(audio) / max_chunk_ms)
     print(f"[Audio Chunking] Splitting into {chunks} parts")
 
@@ -90,11 +90,12 @@ def _chunk_and_transcribe(path: str, mime: str, filename: str) -> Optional[str]:
             start_ms = i * max_chunk_ms
             end_ms = min((i + 1) * max_chunk_ms, len(audio))
             chunk_audio = audio[start_ms:end_ms]
-            chunk_filename = f"{filename}_part{i+1}.mp3"
+
+            chunk_filename = f"{filename_base}_part{i+1}.mp3"
             chunk_path = os.path.join(tmp_dir, chunk_filename)
             chunk_audio.export(chunk_path, format="mp3")
 
-            part_text = _transcribe_file(chunk_path, "audio/mpeg", chunk_filename)
+            part_text = _transcribe_file(chunk_path, chunk_filename)
             if part_text:
                 texts.append(part_text)
             else:
@@ -148,20 +149,26 @@ def get_youtube_transcript(video_id: str) -> Optional[str]:
             return None
 
         subtype = getattr(audio_stream, "subtype", "") or "mp4"
-        mime = "audio/webm" if "webm" in subtype else "audio/mp4"
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            temp_path = os.path.join(tmp_dir, f"audio.{subtype}")
+            raw_path = os.path.join(tmp_dir, f"audio.{subtype}")
             audio_stream.download(output_path=tmp_dir, filename=f"audio.{subtype}")
 
-            file_size = os.path.getsize(temp_path)
+            file_size = os.path.getsize(raw_path)
             print(f"[Downloaded Audio] size={file_size} bytes")
 
-            if file_size <= GROQ_MAX_FILE_BYTES:
-                return _transcribe_file(temp_path, mime, f"audio.{subtype}")
+            # Always convert to mp3 before sending to Groq
+            mp3_path = os.path.join(tmp_dir, "audio.mp3")
+            AudioSegment.from_file(raw_path).export(mp3_path, format="mp3")
+
+            mp3_size = os.path.getsize(mp3_path)
+            print(f"[Converted to MP3] size={mp3_size} bytes")
+
+            if mp3_size <= GROQ_MAX_FILE_BYTES:
+                return _transcribe_file(mp3_path, "audio.mp3")
             else:
-                print(f"[File Too Large] {file_size} bytes — chunking")
-                return _chunk_and_transcribe(temp_path, mime, "audio_chunk")
+                print(f"[File Too Large After MP3] {mp3_size} bytes — chunking")
+                return _chunk_and_transcribe(mp3_path, "audio_chunk")
 
     except Exception as e:
         print(f"[Whisper Error] {e}")
